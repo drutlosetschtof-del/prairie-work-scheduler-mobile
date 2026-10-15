@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Prairie Work Scheduler Mobile</title>
+<style>
+:root{font-family:system-ui,Arial;color:#17251d;background:#eef2ed}body{margin:0}main{max-width:520px;margin:auto;padding:16px}
+header{background:#174c36;color:white;padding:20px;border-radius:14px;margin-bottom:14px}h1{font-size:23px;margin:0}h2{font-size:19px}
+.card{background:white;padding:17px;border-radius:14px;margin-bottom:14px;box-shadow:0 2px 9px #0001}
+label{display:block;font-weight:650;margin:12px 0 5px}input,select{box-sizing:border-box;width:100%;font-size:17px;padding:12px;border:1px solid #b7c5b8;border-radius:8px;background:white}
+button{background:#176342;color:white;border:0;border-radius:9px;padding:13px 16px;font-size:16px;font-weight:700;margin:6px 4px 6px 0}
+button.secondary{background:#e4ece7;color:#174c36}button:disabled{opacity:.5}
+nav{display:flex;gap:5px;flex-wrap:wrap}.hide{display:none}small,.muted{color:#5d6d62}#message{white-space:pre-wrap;font-weight:600}#message.error{color:#a32121}
+</style></head><body><main>
+<header><h1>Prairie Work Scheduler</h1><div>Mobile Field Assistant</div></header>
+<section class="card"><h2>OneDrive connection</h2>
+<label>Microsoft app (client) ID</label><input id="clientId" placeholder="Paste your registered Microsoft app ID">
+<label>OneDrive folder path</label><input id="folder" value="Documents/Prairie Work Scheduler" placeholder="Documents/Prairie Work Scheduler">
+<small>Must be the same OneDrive folder used by the Windows scheduler. Do not include “OneDrive” at the beginning.</small><div>
+<button id="signin">Sign in with Microsoft</button><button id="refresh" class="secondary">Refresh fields</button></div>
+<div id="account" class="muted">Not signed in</div></section>
+<nav class="card"><button data-page="hours">Add Hours</button><button data-page="field" class="secondary">Add Field</button><button data-page="customer" class="secondary">Add Customer</button></nav>
+<section class="card" id="hours">
+<h2>Add tractor hours</h2><label>Customer</label><select id="hoursCustomer"></select>
+<label>Field</label><select id="hoursField"></select>
+<label>Tractor</label><select id="tractor"></select>
+<label>Date</label><input id="workDate" type="date">
+<label>Start meter hours</label><input id="start" type="number" step=".1" inputmode="decimal">
+<label>End meter hours</label><input id="end" type="number" step=".1" inputmode="decimal">
+<p><strong>Hours worked: <span id="worked">—</span></strong></p><button id="saveHours">Save Hours to OneDrive</button></section>
+<section class="card hide" id="field"><h2>Add field</h2>
+<label>Customer</label><select id="fieldCustomer"></select>
+<label>Legal land description</label><input id="legal" placeholder="SW 21 5 4">
+<label>Area</label><input id="area" placeholder="Winkler">
+<label>Acres</label><input id="acres" type="number" min="1" max="640" value="160">
+<label>Work type</label><select id="work"><option>Drainage</option><option>Land Leveling</option><option>Reservoir</option><option>Mapping Only</option><option>Other</option></select>
+<button id="saveField">Save Field to OneDrive</button></section>
+<section class="card hide" id="customer"><h2>Add customer</h2><label>Customer name</label><input id="newCustomer" placeholder="Farmer or business name">
+<button id="saveCustomer">Save Customer to OneDrive</button></section>
+<section class="card"><div id="message">Sign in, then refresh the customer and field lists.</div>
+<small>Saved phone entries appear in Windows after OneDrive sync and clicking IMPORT PHONE. The Windows program remains the authoritative database.</small></section>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.28.1/lib/msal-browser.min.js"></script>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+const saved=JSON.parse(localStorage.getItem('prairieMobilePrefs')||'{}');
+$('clientId').value=saved.clientId||'';$('folder').value=saved.folder||'Documents/Prairie Work Scheduler';
+$('workDate').value=new Date().toLocaleDateString('en-CA');
+let msal=null,account=null,catalog={customers:[],fields:[],tractors:['9560R','9620','8320','4640','Other']};
+const graph='https://graph.microsoft.com/v1.0';
+function msg(t,error=false){$('message').textContent=t;$('message').className=error?'error':''}
+function prefs(){localStorage.setItem('prairieMobilePrefs',JSON.stringify({clientId:$('clientId').value.trim(),folder:$('folder').value.trim(),lastCustomer:$('hoursCustomer').value,lastTractor:$('tractor').value}))}
+function cleanPath(){let p=$('folder').value.trim().replace(/^\/+|\/+$/g,'');if(!p||p.includes('..'))throw Error('Invalid OneDrive folder path');return p.split('/').map(encodeURIComponent).join('/')}
+async function setup(){
+ if(!window.msal)throw Error('Microsoft sign-in library did not load. Check your internet connection.');
+ let clientId=$('clientId').value.trim();if(!/^[0-9a-f-]{36}$/i.test(clientId))throw Error('Enter your Microsoft application client ID first.');
+ prefs();
+ msal=new window.msal.PublicClientApplication({auth:{clientId,authority:'https://login.microsoftonline.com/consumers',redirectUri:location.origin+location.pathname},cache:{cacheLocation:'sessionStorage'}});
+ await msal.initialize();await msal.handleRedirectPromise();
+ account=msal.getAllAccounts()[0]||null;
+ if(!account){const response=await msal.loginPopup({scopes:['Files.ReadWrite','User.Read']});account=response.account}
+ $('account').textContent='Signed in: '+account.username;
+}
+async function token(){if(!account)await setup();try{return (await msal.acquireTokenSilent({account,scopes:['Files.ReadWrite','User.Read']})).accessToken}
+ catch{return (await msal.acquireTokenPopup({account,scopes:['Files.ReadWrite','User.Read']})).accessToken}}
+async function request(path,method='GET',body){
+ const t=await token();let headers={Authorization:'Bearer '+t};
+ if(body!==undefined)headers['Content-Type']='application/json';
+ const response=await fetch(graph+path,{method,headers,body:body===undefined?undefined:JSON.stringify(body)});
+ if(!response.ok){let err=await response.text();throw Error('OneDrive '+response.status+': '+err.slice(0,400))}
+ return response.status===204?null:response.json();
+}
+function pathUrl(suffix){return '/me/drive/root:/'+cleanPath()+suffix}
+async function readCatalog(){
+ const item=await request(pathUrl('/mobile_catalog.json')+':/content');
+ return item;
+}
+// Graph /content redirects to the file's download URL; fetch handles it.
+async function getCatalog(){
+ const t=await token();
+ const response=await fetch(graph+pathUrl('/mobile_catalog.json')+':/content',{headers:{Authorization:'Bearer '+t}});
+ if(!response.ok)throw Error('Cannot find mobile_catalog.json. On Windows click PHONE FIELDS and allow OneDrive to sync. (HTTP '+response.status+')');
+ return response.json();
+}
+async function ensureEntriesFolder(){
+ const t=await token(),path=pathUrl('/Mobile Entries');
+ const existing=await fetch(graph+path,{headers:{Authorization:'Bearer '+t}});
+ if(existing.ok)return;
+ if(existing.status!==404)throw Error('Could not access Mobile Entries folder: '+existing.status);
+ await request(pathUrl(':/children'),'POST',{name:'Mobile Entries',folder:{},'@microsoft.graph.conflictBehavior':'fail'});
+}
+async function send(type,data){
+ await ensureEntriesFolder();
+ const id=crypto.randomUUID(),entry={schema:1,id,type,created:new Date().toISOString(),data};
+ const t=await token(),url=graph+pathUrl('/Mobile Entries/'+id+'.json')+':/content';
+ const r=await fetch(url,{method:'PUT',headers:{Authorization:'Bearer '+t,'Content-Type':'application/json'},body:JSON.stringify(entry)});
+ if(!r.ok)throw Error('Save failed: '+r.status+' '+(await r.text()).slice(0,250));
+ prefs();msg('Saved to OneDrive. Entry ID: '+id+'\nImport it using IMPORT PHONE in Windows after sync.');
+}
+function populate(select,items,selected){select.replaceChildren(...items.map(item=>{let o=document.createElement('option');o.value=item.value;o.textContent=item.label;return o}));if(selected&&items.some(x=>x.value===selected))select.value=selected}
+function fieldsForCustomer(){
+ let c=$('hoursCustomer').value;
+ let items=catalog.fields.filter(f=>f.customer===c).map(f=>({value:f.id,label:f.legal+' | '+(f.area||'')}));
+ populate($('hoursField'),items,saved.lastFieldId);
+}
+function draw(){
+ const customers=catalog.customers.map(c=>({value:c,label:c}));
+ populate($('hoursCustomer'),customers,saved.lastCustomer);
+ populate($('fieldCustomer'),customers,saved.lastCustomer);
+ populate($('tractor'),catalog.tractors.map(t=>({value:t,label:t})),saved.lastTractor);
+ fieldsForCustomer();
+}
+$('signin').onclick=async()=>{try{await setup();msg('Signed in. Click Refresh fields.')}catch(e){msg(e.message,true)}};
+$('refresh').onclick=async()=>{try{catalog=await getCatalog();draw();msg('Loaded '+catalog.customers.length+' customers and '+catalog.fields.length+' fields.')}catch(e){msg(e.message,true)}};
+$('hoursCustomer').onchange=()=>{fieldsForCustomer();prefs()};
+$('tractor').onchange=prefs;
+$('hoursField').onchange=()=>{saved.lastFieldId=$('hoursField').value};
+for(let id of ['start','end'])$(id).oninput=()=>{let a=Number($('start').value),b=Number($('end').value);$('worked').textContent=$('start').value&&$('end').value&&b>=a?(b-a).toFixed(1):'—'};
+document.querySelectorAll('[data-page]').forEach(b=>b.onclick=()=>{for(let id of ['hours','field','customer'])$(id).classList.toggle('hide',id!==b.dataset.page)});
+$('saveHours').onclick=async()=>{try{
+ const a=Number($('start').value),b=Number($('end').value);
+ if(!$('hoursField').value||!$('start').value||!$('end').value||!Number.isFinite(a)||!Number.isFinite(b)||a<0||b<a)throw Error('Choose a field and enter valid meter hours.');
+ if(!$('workDate').value)throw Error('Choose a date.');
+ await send('hours',{field_id:$('hoursField').value,tractor:$('tractor').value,date:$('workDate').value,start:a,end:b});
+ saved.lastFieldId=$('hoursField').value;$('start').value=$('end').value;$('end').value='';
+ }catch(e){msg(e.message,true)}};
+$('saveCustomer').onclick=async()=>{try{
+ let name=$('newCustomer').value.trim();if(!name)throw Error('Enter a customer name.');
+ if(catalog.customers.some(c=>c.toLowerCase()===name.toLowerCase()))throw Error('Customer already exists.');
+ await send('customer',{customer:name});$('newCustomer').value='';
+ }catch(e){msg(e.message,true)}};
+$('saveField').onclick=async()=>{try{
+ let customer=$('fieldCustomer').value,legal=$('legal').value.trim(),acres=Number($('acres').value);
+ if(!customer||!legal||!Number.isFinite(acres)||acres<=0||acres>640)throw Error('Enter customer, legal description and valid acres.');
+ if(catalog.fields.some(f=>f.customer.toLowerCase()===customer.toLowerCase()&&f.legal.replace(/[^a-z0-9]/gi,'').toLowerCase()===legal.replace(/[^a-z0-9]/gi,'').toLowerCase()))throw Error('This customer already has that field.');
+ await send('field',{customer,legal,area:$('area').value.trim(),acres,work:$('work').value});
+ $('legal').value='';
+ }catch(e){msg(e.message,true)}};
+</script></body></html>
