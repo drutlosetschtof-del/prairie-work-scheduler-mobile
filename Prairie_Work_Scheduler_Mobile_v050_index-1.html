@@ -1,0 +1,97 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Prairie Work Scheduler | Phone Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>*{box-sizing:border-box}body{margin:0;font:15px system-ui,Arial;background:#eef2ed;color:#173b2b}header{background:#174c36;color:white;padding:12px 14px;display:flex;align-items:center;justify-content:space-between}h1{font-size:18px;margin:0}button{padding:10px 12px;border:0;border-radius:8px;background:#17623f;color:white;font-weight:650}input,select{padding:10px;width:100%;border:1px solid #aebdb2;border-radius:7px;background:white}main{padding:10px;max-width:1100px;margin:auto}#setup{background:white;border-radius:9px;padding:12px;margin-bottom:10px}#setup label{display:block;margin:8px 0}#filters{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:10px}#filters label{font-size:12px;font-weight:bold}#filters label select{margin-top:4px;font-size:14px}#map{height:65vh;min-height:350px;border-radius:9px;z-index:1}#status{font-size:13px;padding:9px}#farmerBox{max-height:180px;overflow:auto;background:white;padding:6px;border:1px solid #aaa;border-radius:7px}#farmerBox label{display:block;padding:5px;font-weight:400}#farmerBox input{width:auto;margin-right:8px}details{background:white;border-radius:8px;padding:10px;margin-bottom:8px}summary{font-weight:650;cursor:pointer}a.nav{display:inline-block;margin-top:8px;padding:8px;background:#17623f;color:white;border-radius:6px;text-decoration:none}.controls{display:flex;gap:7px;flex-wrap:wrap}small{color:#566}</style></head>
+<body><header><h1>Prairie Work Scheduler — Field Map</h1><button id="reload">Refresh</button></header>
+<main><details id="setup" open><summary>Supabase access code</summary>
+<label>Private access code<input id="accessCode" type="password" autocomplete="off" placeholder="Enter your Prairie access code"></label>
+<small>Enter your code once on this phone. It is stored in this browser; anyone with access to this unlocked phone may use it.</small>
+<div class="controls" style="margin-top:10px"><button id="signin">Save Code & Load</button><button id="signout">Forget Code</button></div></details>
+<details><summary>Choose farmers <span id="farmCount">(all)</span></summary><div class="controls" style="margin:8px 0"><button id="allFarmers">All farmers</button><button id="noneFarmers">Clear selection</button></div><div id="farmerBox"></div></details>
+<div id="filters"><label>Work type<select id="work"><option value="">All work</option><option value="Drainage">Drainage</option><option value="Mapping">Mapping</option><option value="Other">Other</option></select></label>
+<label>Work status<select id="statusFilter"><option value="">All statuses</option><option>Ready</option><option>Too Wet</option><option>In Progress</option><option>Finished</option><option>Waiting</option></select></label>
+<label>Area<select id="area"><option value="">All areas</option></select></label><label>Search field / farmer<input id="search" placeholder="e.g. Frank or NW 26"></label></div>
+<div class="controls" style="margin-bottom:8px"><button id="fit">Zoom to Fields</button><button id="satellite">Satellite / Streets</button></div>
+<div id="map"></div><div id="status" role="status">Enter access code to load fields.</div>
+</main><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script>
+'use strict';
+const $=id=>document.getElementById(id);
+const SYNC_URL='https://xdeppkzmxcpnvxweusvm.supabase.co/functions/v1/super-action';
+const config=JSON.parse(localStorage.getItem('pwsSupabaseSettings')||'{}');
+$('accessCode').value=config.accessCode||'';
+let cloudRevision=null,cloudData=null;
+async function cloud(action,data,revision){
+ const code=$('accessCode').value.trim();if(code.length<16)throw Error('Enter your private access code (at least 16 characters).');
+ const payload={action};if(data!==undefined)payload.data=data;if(revision!==undefined)payload.revision=revision;
+ const response=await fetch(SYNC_URL,{method:'POST',headers:{'Content-Type':'application/json','x-prairie-code':code},body:JSON.stringify(payload),cache:'no-store'});
+ const result=await response.json();if(!response.ok)throw Error(result.error||('HTTP '+response.status));return result;
+}
+const map=L.map('map').setView([49.2,-97.9],9);
+const satellite=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,attribution:'Imagery © Esri'});
+const streets=L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap contributors'});
+satellite.addTo(map);let sat=true;
+let allFields=[],selectedFarmers=new Set(),farmerNames=[],farmerFilterActive=false,markers=L.featureGroup().addTo(map),loaded=false;
+const statusColors={'Ready':'#238a40','Too Wet':'#c13939','In Progress':'#236ac6','Finished':'#777','Waiting':'#d28c24'};
+function message(s){$('status').textContent=s}
+function saveSettings(){localStorage.setItem('pwsSupabaseSettings',JSON.stringify({accessCode:$('accessCode').value.trim()}))}
+async function getData(){
+ const response=await cloud('read');cloudRevision=response.updated_at;cloudData=response.data;
+ if(cloudData===null)throw Error('Cloud database is empty. Upload the Windows data using CLOUD SYNC first.');
+ if(!Array.isArray(cloudData.bookings))throw Error('Invalid Prairie Work Scheduler cloud data.');
+ const fields=[];
+ for(const booking of cloudData.bookings)for(const field of booking.fields||[]){
+  const lat=Number(field.latitude),lon=Number(field.longitude);
+  if(field.latitude==null||field.longitude==null||!Number.isFinite(lat)||!Number.isFinite(lon)||Math.abs(lat)>90||Math.abs(lon)>180)continue;
+  fields.push({farmer:String(booking.farmer||''),legal:String(field.legal||''),area:String(field.area||booking.area||''),work:String(field.work||''),status:String(field.status||''),mapping:String(field.mapping_status||''),acres:field.acres,lat,lon,id:field.id});
+ }
+ return fields;
+}
+function renderFarmerChoices(){
+ const holder=$('farmerBox');holder.replaceChildren();
+ for(const name of farmerNames){
+  const label=document.createElement('label'),box=document.createElement('input');box.type='checkbox';box.checked=!farmerFilterActive||selectedFarmers.has(name);
+  box.addEventListener('change',()=>{farmerFilterActive=true;if(box.checked)selectedFarmers.add(name);else selectedFarmers.delete(name);render()});
+  label.append(box,document.createTextNode(name));holder.append(label);
+ }
+}
+function render(){
+ const area=$('area').value,work=$('work').value,status=$('statusFilter').value,q=$('search').value.trim().toLowerCase();
+ const filtered=allFields.filter(f=>(!farmerFilterActive||selectedFarmers.has(f.farmer))&&(!area||f.area===area)&&(!status||f.status===status)&&(!q||(f.farmer+' '+f.legal).toLowerCase().includes(q))&&(!work||(work==='Mapping'?(f.work==='Mapping Only'||f.mapping!=='Not Needed'&&!!f.mapping):work==='Other'?(f.work!=='Drainage'&&f.work!=='Mapping Only'):f.work===work)));
+ markers.clearLayers();
+ for(const f of filtered){
+  const dot=L.circleMarker([f.lat,f.lon],{radius:9,color:'#fff',weight:2,fillColor:statusColors[f.status]||'#d28c24',fillOpacity:1});
+  const container=document.createElement('div');
+  const lines=[f.farmer,f.legal,`${f.acres??'—'} acres`,f.work||'Work unspecified',`Status: ${f.status||'—'}`,`Mapping: ${f.mapping||'—'}`];
+  for(const [i,line] of lines.entries()){const p=document.createElement('div');p.textContent=line;if(i===0)p.style.fontWeight='bold';container.append(p)}
+  const a=document.createElement('a');a.className='nav';a.textContent='Navigate in Google Maps';a.href='https://www.google.com/maps/dir/?api=1&destination='+encodeURIComponent(f.lat+','+f.lon);a.target='_blank';a.rel='noopener';container.append(a);
+  dot.bindPopup(container);dot.addTo(markers);
+ }
+ $('farmCount').textContent=farmerFilterActive?`(${selectedFarmers.size} selected)`:'(all)';
+ message(`${filtered.length} fields displayed • ${allFields.length} located fields available • Updated ${new Date().toLocaleTimeString()}`);
+}
+function fit(){if(markers.getLayers().length)map.fitBounds(markers.getBounds().pad(.18),{maxZoom:15})}
+async function refresh(){
+ message('Loading latest fields from Supabase…');
+ try{
+  const previous=loaded?map.getCenter():null,zoom=map.getZoom();
+  allFields=await getData();loaded=true;
+  farmerNames=[...new Set(allFields.map(f=>f.farmer))].sort((a,b)=>a.localeCompare(b));
+  selectedFarmers=new Set([...selectedFarmers].filter(f=>farmerNames.includes(f)));
+  renderFarmerChoices();
+  const areaValue=$('area').value;
+  $('area').replaceChildren(new Option('All areas',''),...[...new Set(allFields.map(f=>f.area).filter(Boolean))].sort().map(x=>new Option(x,x)));
+  $('area').value=areaValue;
+  render();
+  if(previous)map.setView(previous,zoom);else fit();
+  $('setup').open=false;
+ }catch(e){message('Could not refresh: '+e.message);$('setup').open=true}
+}
+$('signin').onclick=()=>{saveSettings();refresh()};$('reload').onclick=refresh;
+$('signout').onclick=()=>{localStorage.removeItem('pwsSupabaseSettings');$('accessCode').value='';allFields=[];markers.clearLayers();message('Access code forgotten on this phone.')};
+$('allFarmers').onclick=()=>{selectedFarmers.clear();farmerFilterActive=false;renderFarmerChoices();render()};
+$('noneFarmers').onclick=()=>{selectedFarmers.clear();farmerFilterActive=true;renderFarmerChoices();render()};
+for(const id of ['work','statusFilter','area'])$(id).addEventListener('change',render);
+$('search').addEventListener('input',render);
+$('fit').onclick=fit;
+$('satellite').onclick=()=>{map.removeLayer(sat?satellite:streets);(sat?streets:satellite).addTo(map);sat=!sat};
+if(config.accessCode)refresh();
+</script></body></html>
